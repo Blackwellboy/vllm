@@ -1,0 +1,36 @@
+name: Squash DSv4 sparse MLA bounds patch
+
+on:
+  push:
+    branches:
+      - automation/squash-dsv4-sparse-mla-bounds
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/dsv4-sparse-mla-block-table-bounds
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Collapse patch to one attributed commit
+        shell: bash
+        run: |
+          BASE=392db567b260cb4d1e5f91547b65d527038fe641
+          git config user.name "Blackwellboy"
+          git config user.email "76774064+Blackwellboy@users.noreply.github.com"
+          git reset --soft "$BASE"
+          git diff --cached --check
+          git diff --cached --name-only
+          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = "tests/kernels/attention/test_flashmla_sparse.py vllm/models/deepseek_v4/common/ops/cache_utils.py "
+          git commit -m "[Bugfix][Kernel][DSv4] Bound sparse MLA block-table gathers" \
+            -m "Assisted-by: ChatGPT (OpenAI)" \
+            -m "Signed-off-by: Blackwellboy <76774064+Blackwellboy@users.noreply.github.com>"
+          git push --force-with-lease origin HEAD:fix/dsv4-sparse-mla-block-table-bounds
