@@ -1,0 +1,57 @@
+name: Format and validate DSv4 sparse MLA bounds patch
+
+on:
+  push:
+    branches:
+      - automation/format-dsv4-sparse-mla-bounds
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/dsv4-sparse-mla-block-table-bounds
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install pre-commit
+        run: python -m pip install --disable-pip-version-check pre-commit
+
+      - name: Apply configured ruff formatting
+        shell: bash
+        run: |
+          pre-commit run ruff-format --files \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py || true
+
+      - name: Run full focused pre-commit set
+        shell: bash
+        run: |
+          pre-commit run --files \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          python -m py_compile \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          git diff --check
+
+      - name: Commit formatting if needed
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No formatting changes required."
+            exit 0
+          fi
+          git config user.name "Blackwellboy"
+          git config user.email "76774064+Blackwellboy@users.noreply.github.com"
+          git add \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          git commit -s -m "style: format DSv4 sparse MLA bounds tests"
+          git push origin HEAD:fix/dsv4-sparse-mla-block-table-bounds
