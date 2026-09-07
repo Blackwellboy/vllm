@@ -14,9 +14,7 @@ def test_compute_global_topk_indices_and_lens_rejects_oob_block_table_axes():
 
     # Keep a wider backing allocation so the logical column-bound regression
     # proves shape[1], not row stride, is the validity boundary.
-    block_table_backing = torch.tensor(
-        [[10, 11, 12]], dtype=torch.int32, device=device
-    )
+    block_table_backing = torch.tensor([[10, 11, 12]], dtype=torch.int32, device=device)
     block_table = block_table_backing[:, :2]
     assert block_table.shape == (1, 2)
     assert block_table.stride(0) == 3
@@ -30,9 +28,7 @@ def test_compute_global_topk_indices_and_lens_rejects_oob_block_table_axes():
         dtype=torch.int32,
         device=device,
     )
-    token_to_req_indices = torch.tensor(
-        [0, 1, 0], dtype=torch.int32, device=device
-    )
+    token_to_req_indices = torch.tensor([0, 1, 0], dtype=torch.int32, device=device)
     is_valid_token = torch.tensor([True, True, True], device=device)
 
     actual_indices, actual_lens = compute_global_topk_indices_and_lens(
