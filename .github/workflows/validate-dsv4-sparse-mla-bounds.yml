@@ -1,0 +1,36 @@
+name: Validate DSv4 sparse MLA bounds patch
+
+on:
+  push:
+    branches:
+      - automation/validate-dsv4-sparse-mla-bounds
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v4
+        with:
+          ref: automation/validate-dsv4-sparse-mla-bounds
+          fetch-depth: 1
+
+      - name: Python syntax
+        run: |
+          python -m py_compile \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          git diff --check HEAD^ HEAD || true
+
+      - name: Install pre-commit
+        run: python -m pip install --disable-pip-version-check pre-commit
+
+      - name: Run focused pre-commit hooks
+        run: |
+          pre-commit run --files \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
