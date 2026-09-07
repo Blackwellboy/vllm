@@ -1,0 +1,177 @@
+name: Apply DSv4 sparse MLA bounds patch
+
+on:
+  push:
+    branches:
+      - automation/apply-dsv4-sparse-mla-bounds
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/dsv4-sparse-mla-block-table-bounds
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply focused source and regression changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          cache_path = Path("vllm/models/deepseek_v4/common/ops/cache_utils.py")
+          text = cache_path.read_text()
+
+          replacements = [
+              (
+                  """        token_to_req_indices,\n        block_table,\n        block_table.stride(0),\n""",
+                  """        token_to_req_indices,\n        block_table,\n        block_table.shape[0],\n        block_table.shape[1],\n        block_table.stride(0),\n""",
+              ),
+              (
+                  """@triton.jit\ndef _compute_global_topk_indices_and_lens_kernel(\n    global_topk_indices_ptr,\n    global_topk_indices_stride: tl.constexpr,\n    topk_lens_ptr,\n    topk_indices_ptr,\n    topk_indices_stride: tl.constexpr,\n    topk: tl.constexpr,\n    token_to_req_indices_ptr,\n    block_table_ptr,\n    block_table_stride: tl.constexpr,\n""",
+                  """@triton.jit(do_not_specialize=[\"block_table_rows\", \"block_table_cols\"])\ndef _compute_global_topk_indices_and_lens_kernel(\n    global_topk_indices_ptr,\n    global_topk_indices_stride: tl.constexpr,\n    topk_lens_ptr,\n    topk_indices_ptr,\n    topk_indices_stride: tl.constexpr,\n    topk: tl.constexpr,\n    token_to_req_indices_ptr,\n    block_table_ptr,\n    block_table_rows,\n    block_table_cols,\n    block_table_stride: tl.constexpr,\n""",
+              ),
+              (
+                  """    is_valid_token = tl.load(is_valid_token_ptr + token_idx)\n    req_idx = tl.load(token_to_req_indices_ptr + token_idx)\n\n    count = tl.zeros((), dtype=tl.int32)\n""",
+                  """    is_valid_token = tl.load(is_valid_token_ptr + token_idx)\n    req_idx = tl.load(token_to_req_indices_ptr + token_idx)\n    req_idx_valid = (req_idx >= 0) & (req_idx < block_table_rows)\n\n    count = tl.zeros((), dtype=tl.int32)\n""",
+              ),
+              (
+                  """        is_valid = local_idx >= 0\n\n        block_indices = local_idx // block_size\n        block_numbers = tl.load(\n            block_table_ptr + req_idx * block_table_stride + block_indices,\n            mask=mask & is_valid,\n        )\n""",
+                  """        block_indices = local_idx // block_size\n        is_valid = (\n            (local_idx >= 0)\n            & is_valid_token\n            & req_idx_valid\n            & (block_indices < block_table_cols)\n        )\n        block_numbers = tl.load(\n            block_table_ptr + req_idx * block_table_stride + block_indices,\n            mask=mask & is_valid,\n            other=0,\n        )\n""",
+              ),
+              (
+                  """    # Zero out length for padding tokens.\n    tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))\n""",
+                  """    tl.store(topk_lens_ptr + token_idx, count)\n""",
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"cache_utils replacement expected once, found {count}: {old[:80]!r}")
+              text = text.replace(old, new, 1)
+          cache_path.write_text(text)
+
+          test_path = Path("tests/kernels/attention/test_flashmla_sparse.py")
+          test_text = test_path.read_text()
+          anchor = "import pytest\nimport torch\n\n\n"
+          if test_text.count(anchor) != 1:
+              raise SystemExit("test import anchor is not unique")
+
+          tests = r'''def test_compute_global_topk_indices_and_lens_rejects_oob_block_table_axes():
+              from vllm.models.deepseek_v4.common.ops.cache_utils import (
+                  compute_global_topk_indices_and_lens,
+              )
+
+              device = torch.device("cuda")
+              block_size = 4
+
+              # Keep a wider backing allocation so the logical column-bound regression
+              # proves shape[1], not row stride, is the validity boundary.
+              block_table_backing = torch.tensor(
+                  [[10, 11, 12]], dtype=torch.int32, device=device
+              )
+              block_table = block_table_backing[:, :2]
+              assert block_table.shape == (1, 2)
+              assert block_table.stride(0) == 3
+
+              topk_indices = torch.tensor(
+                  [
+                      [0, 5],  # valid row + valid columns
+                      [0, 5],  # invalid request row (req_idx=1)
+                      [8, -1],  # valid request row, invalid logical block column 2
+                  ],
+                  dtype=torch.int32,
+                  device=device,
+              )
+              token_to_req_indices = torch.tensor(
+                  [0, 1, 0], dtype=torch.int32, device=device
+              )
+              is_valid_token = torch.tensor([True, True, True], device=device)
+
+              actual_indices, actual_lens = compute_global_topk_indices_and_lens(
+                  topk_indices,
+                  token_to_req_indices,
+                  block_table,
+                  block_size,
+                  is_valid_token,
+              )
+              torch.accelerator.synchronize()
+
+              expected_indices = torch.tensor(
+                  [
+                      [40, 45],
+                      [-1, -1],
+                      [-1, -1],
+                  ],
+                  dtype=torch.int32,
+                  device=device,
+              )
+              expected_lens = torch.tensor([2, 0, 0], dtype=torch.int32, device=device)
+
+              torch.testing.assert_close(actual_indices, expected_indices)
+              torch.testing.assert_close(actual_lens, expected_lens)
+
+
+          def test_compute_global_topk_indices_and_lens_masks_invalid_tokens_before_gather():
+              from vllm.models.deepseek_v4.common.ops.cache_utils import (
+                  compute_global_topk_indices_and_lens,
+              )
+
+              device = torch.device("cuda")
+              block_table = torch.tensor([[10, 11]], dtype=torch.int32, device=device)
+              topk_indices = torch.tensor([[0, 5]], dtype=torch.int32, device=device)
+
+              # Deliberately invalid req_idx. A padding token must not dereference it.
+              token_to_req_indices = torch.tensor([7], dtype=torch.int32, device=device)
+              is_valid_token = torch.tensor([False], device=device)
+
+              actual_indices, actual_lens = compute_global_topk_indices_and_lens(
+                  topk_indices,
+                  token_to_req_indices,
+                  block_table,
+                  4,
+                  is_valid_token,
+              )
+              torch.accelerator.synchronize()
+
+              assert actual_indices.cpu().tolist() == [[-1, -1]]
+              assert actual_lens.cpu().tolist() == [0]
+
+
+          '''
+          # The raw string is indented by the workflow Python source. Normalize it.
+          import textwrap
+          tests = textwrap.dedent(tests)
+          test_text = test_text.replace(anchor, anchor + tests, 1)
+          test_path.write_text(test_text)
+          PY
+
+      - name: Sanity-check diff
+        shell: bash
+        run: |
+          python -m py_compile \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          git diff --check
+          git diff -- \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+
+      - name: Commit and push target branch
+        shell: bash
+        run: |
+          git config user.name "Blackwellboy"
+          git config user.email "76774064+Blackwellboy@users.noreply.github.com"
+          git add \
+            vllm/models/deepseek_v4/common/ops/cache_utils.py \
+            tests/kernels/attention/test_flashmla_sparse.py
+          git commit -s -m "[Bugfix][DSv4] bound sparse MLA block-table gathers"
+          git push origin HEAD:fix/dsv4-sparse-mla-block-table-bounds
