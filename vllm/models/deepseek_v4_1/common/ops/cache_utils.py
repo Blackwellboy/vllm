@@ -469,6 +469,7 @@ def compute_global_topk_indices_and_lens(
         token_to_req_indices,
         block_table,
         block_table.stride(0),
+        block_table.shape[0],
         block_size,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
@@ -487,6 +488,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride: tl.constexpr,
+    block_table_rows: tl.constexpr,
     block_size: tl.constexpr,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -505,12 +507,25 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
-
         block_indices = local_idx // block_size
+        # Dual-axis bounds: column (stride) + row (num_reqs). Never infer
+        # row count from stride. Invalid → -1 and excluded from topk_lens.
+        # safe_req is address-formation only under a false load mask — it
+        # must not become a semantic clamp onto another request's row.
+        is_valid = (
+            (local_idx >= 0)
+            & (block_indices >= 0)
+            & (block_indices < block_table_stride)
+            & (req_idx >= 0)
+            & (req_idx < block_table_rows)
+        )
+        safe_req = tl.where(
+            (req_idx >= 0) & (req_idx < block_table_rows), req_idx, 0
+        )
         block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
+            block_table_ptr + safe_req * block_table_stride + block_indices,
             mask=mask & is_valid,
+            other=0,
         )
         block_offsets = local_idx % block_size
 

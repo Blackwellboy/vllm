@@ -587,6 +587,7 @@ class ComputeGlobalTopkIndicesAndLensKernel(
         topk_indices_stride: int
         topk: int
         block_table_stride: int
+        block_table_rows: int
         block_size: int
 
     @staticmethod
@@ -601,6 +602,7 @@ class ComputeGlobalTopkIndicesAndLensKernel(
         token_to_req_indices_ptr,
         block_table_ptr,
         block_table_stride: tl.constexpr,
+        block_table_rows: tl.constexpr,
         block_size: tl.constexpr,
         is_valid_token_ptr,
         TRITON_BLOCK_SIZE: tl.constexpr,
@@ -619,12 +621,25 @@ class ComputeGlobalTopkIndicesAndLensKernel(
                 mask=mask,
                 other=-1,
             )
-            is_valid = local_idx >= 0
-
             block_indices = local_idx // block_size
+            # Dual-axis bounds: column (stride) + row (num_reqs). Never infer
+            # row count from stride. Invalid → -1 and excluded from topk_lens.
+            # safe_req is address-formation only under a false load mask — it
+            # must not become a semantic clamp onto another request's row.
+            is_valid = (
+                (local_idx >= 0)
+                & (block_indices >= 0)
+                & (block_indices < block_table_stride)
+                & (req_idx >= 0)
+                & (req_idx < block_table_rows)
+            )
+            safe_req = tl.where(
+                (req_idx >= 0) & (req_idx < block_table_rows), req_idx, 0
+            )
             block_numbers = tl.load(
-                block_table_ptr + req_idx * block_table_stride + block_indices,
+                block_table_ptr + safe_req * block_table_stride + block_indices,
                 mask=mask & is_valid,
+                other=0,
             )
             block_offsets = local_idx % block_size
 
@@ -649,6 +664,7 @@ class ComputeGlobalTopkIndicesAndLensKernel(
         block_size: int,
         block_table_block_size: int,
         max_model_len: int,
+        block_table_rows: int = 1,
     ) -> CompileKey:
         return self.CompileKey(
             global_topk_indices_stride=topk_width,
@@ -656,6 +672,7 @@ class ComputeGlobalTopkIndicesAndLensKernel(
             topk=topk_width,
             block_table_stride=(max_model_len + block_table_block_size - 1)
             // block_table_block_size,
+            block_table_rows=block_table_rows,
             block_size=block_size,
         )
 
@@ -710,7 +727,7 @@ class ComputeGlobalTopkIndicesAndLensKernel(
             token_to_req_indices=int32_ptr,
             block_table=TritonWarmupTensor(
                 torch.int32,
-                shape=(1, compile_key.block_table_stride),
+                shape=(compile_key.block_table_rows, compile_key.block_table_stride),
             ),
             block_size=compile_key.block_size,
             is_valid_token=TritonWarmupTensor(torch.bool),
@@ -733,6 +750,8 @@ class ComputeGlobalTopkIndicesAndLensKernel(
             topk_indices_stride=topk_indices.stride(0),
             topk=topk_indices.shape[-1],
             block_table_stride=block_table.stride(0),
+            # Do not infer row count from stride — pass shape[0] explicitly.
+            block_table_rows=block_table.shape[0],
             TRITON_BLOCK_SIZE=self.TRITON_BLOCK_SIZE,
         )
 
