@@ -490,6 +490,23 @@ class CommonAttentionMetadata:
     def token_to_req_indices(self, buffer: torch.Tensor) -> torch.Tensor:
         """Build or reuse the per-token request index mapping."""
         num_tokens = self.num_actual_tokens
+
+        # The request-id domain used by sparse gather consumers must match the
+        # logical block-table row domain. Never clamp an OOB request id onto
+        # another request's KV row; fail closed if producer metadata disagrees.
+        query_slots = self.query_start_loc.shape[0] - 1
+        if query_slots != self.num_reqs:
+            raise RuntimeError(
+                "token_to_req_indices: query_start_loc slots "
+                f"({query_slots}) != num_reqs ({self.num_reqs})"
+            )
+        block_table_rows = self.block_table_tensor.shape[0]
+        if block_table_rows != self.num_reqs:
+            raise RuntimeError(
+                "token_to_req_indices: block_table rows "
+                f"({block_table_rows}) != num_reqs ({self.num_reqs})"
+            )
+
         if self._token_to_req_indices_cache is not None:
             assert self._token_to_req_indices_cache.device == buffer.device
             assert self._token_to_req_indices_cache.dtype == torch.int32
@@ -508,7 +525,7 @@ class CommonAttentionMetadata:
         _token_request_mapping_kernel[((num_output_tokens + 255) // 256,)](
             self.query_start_loc,
             buffer,
-            self.query_start_loc.shape[0] - 1,
+            self.num_reqs,
             num_mapped_tokens,
             num_output_tokens,
             num_warps=4,
